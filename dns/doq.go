@@ -32,7 +32,9 @@ const (
 	// QUICCodeInternalError signals that the DoQ implementation encountered
 	// an internal error and is incapable of pursuing the transaction or the
 	// connection.
-	QUICCodeInternalError = quic.ApplicationErrorCode(1)
+	QUICCodeInternalError    = quic.ApplicationErrorCode(1)
+	QUICCodeProtocolError    = quic.ApplicationErrorCode(2)
+	QUICCodeRequestCancelled = quic.StreamErrorCode(3)
 	// QUICKeepAlivePeriod is the value that we pass to *quic.Config and that
 	// controls the period with with keep-alive frames are being sent to the
 	// connection. We set it to 20s as it would be in the quic-go@v0.27.1 with
@@ -43,6 +45,20 @@ const (
 	QUICKeepAlivePeriod = time.Second * 20
 	DefaultTimeout      = time.Second * 5
 )
+
+var (
+	errDoQReset    = errors.New("DoQ connection reset during dialing")
+	errDoQProtocol = errors.New("DoQ protocol error")
+)
+
+// doqDialCall is shared by queries waiting for the same handshake. All fields
+// except done are protected by connMu; err is immutable after done is closed.
+type doqDialCall struct {
+	done      chan struct{}
+	cancel    context.CancelFunc
+	abandoned bool
+	err       error
+}
 
 // dnsOverQUIC is a struct that implements the Upstream interface for the
 // DNS-over-QUIC protocol (spec: https://www.rfc-editor.org/rfc/rfc9250.html).
@@ -56,8 +72,10 @@ type dnsOverQUIC struct {
 
 	// conn is the current active QUIC connection.  It can be closed and
 	// re-opened when needed.
-	conn   *quic.Conn
-	connMu sync.RWMutex
+	conn    *quic.Conn
+	connMu  sync.Mutex
+	dialing *doqDialCall
+	closed  bool
 
 	addr           string
 	dialer         *dnsDialer
@@ -92,75 +110,87 @@ func newDoQ(addr string, resolver resolver.Resolver, params map[string]string, p
 func (doq *dnsOverQUIC) Address() string { return doq.addr }
 
 func (doq *dnsOverQUIC) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
-	// When sending queries over a QUIC connection, the DNS Message ID MUST be
-	// set to zero.
+	// Keep the finalizer from closing a connection while a query is using it.
+	defer runtime.KeepAlive(doq)
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultTimeout)
+		defer cancel()
+	}
+
 	m = m.Copy()
 	id := m.Id
 	m.Id = 0
 	defer func() {
-		// Restore the original ID to not break compatibility with proxies.
-		m.Id = id
 		if msg != nil {
 			msg.Id = id
 		}
 	}()
 
-	// Check if there was already an active conn before sending the request.
-	// We'll only attempt to re-connect if there was one.
-	hasConnection := doq.hasConnection()
-
-	// Make the first attempt to send the DNS query.
-	msg, err = doq.exchangeQUIC(ctx, m)
-
-	// Make up to 2 attempts to re-open the QUIC connection and send the request
-	// again.  There are several cases where this workaround is necessary to
-	// make DoQ usable.  We need to make 2 attempts in the case when the
-	// connection was closed (due to inactivity for example) AND the server
-	// refuses to open a 0-RTT connection.
-	for i := 0; hasConnection && doq.shouldRetry(err) && ctx.Err() == nil && i < 2; i++ {
+	// Retry only connection errors known to be recoverable, at most twice.
+	// Each attempt retains its connection identity, so a late error can never
+	// close a replacement installed by another query.
+	for attempt := 0; ; attempt++ {
+		conn, connErr := doq.getConnection(ctx)
+		if connErr != nil {
+			return nil, connErr
+		}
+		msg, err = doq.exchangeQUIC(ctx, conn, m)
+		if err == nil {
+			return msg, nil
+		}
+		retry := isQUICRetryError(err)
+		if retry || conn.Context().Err() != nil || errors.Is(err, errDoQProtocol) {
+			doq.closeConnWithError(conn, err)
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if !retry || attempt >= 2 {
+			return nil, err
+		}
 		log.Debugln("re-creating the QUIC connection and retrying due to %v", err)
-
-		// Close the active connection to make sure we'll try to re-connect.
-		doq.closeConnWithError(err)
-
-		// Retry sending the request.
-		msg, err = doq.exchangeQUIC(ctx, m)
 	}
-
-	if err != nil {
-		// If we're unable to exchange messages, make sure the connection is
-		// closed and signal about an internal error.
-		doq.closeConnWithError(err)
-	}
-
-	return msg, err
 }
 
-// Close implements the Upstream interface for *dnsOverQUIC.
-func (doq *dnsOverQUIC) Close() (err error) {
+// Close permanently closes this client. ResetConnection permits later dialing.
+func (doq *dnsOverQUIC) Close() error {
 	doq.connMu.Lock()
-	defer doq.connMu.Unlock()
-
 	runtime.SetFinalizer(doq, nil)
-
-	if doq.conn != nil {
-		err = doq.conn.CloseWithError(QUICCodeNoError, "")
+	doq.closed = true
+	conn := doq.conn
+	doq.conn = nil
+	if doq.dialing != nil {
+		doq.dialing.abandoned = true
+		doq.dialing.cancel()
 	}
-
-	return err
+	doq.connMu.Unlock()
+	if conn != nil {
+		return conn.CloseWithError(QUICCodeNoError, "")
+	}
+	return nil
 }
 
 func (doq *dnsOverQUIC) ResetConnection() {
-	doq.closeConnWithError(nil)
+	doq.connMu.Lock()
+	conn := doq.conn
+	doq.conn = nil
+	if doq.dialing != nil {
+		doq.dialing.abandoned = true
+		doq.dialing.cancel()
+	}
+	doq.connMu.Unlock()
+	if conn != nil {
+		_ = conn.CloseWithError(QUICCodeNoError, "")
+	}
 }
 
-// exchangeQUIC attempts to open a QUIC connection, send the DNS message
-// through it and return the response it got from the server.
-func (doq *dnsOverQUIC) exchangeQUIC(ctx context.Context, msg *D.Msg) (resp *D.Msg, err error) {
+// exchangeQUIC exchanges one message on the supplied shared connection.
+func (doq *dnsOverQUIC) exchangeQUIC(ctx context.Context, conn *quic.Conn, msg *D.Msg) (resp *D.Msg, err error) {
 	// All DNS messages (queries and responses) sent over DoQ connections MUST
 	// be encoded as a 2-octet length field followed by the message content as
 	// specified in [RFC1035].
-	// Note: we do not support receiving multiple messages over a single connection.
+	// Note: we do not support receiving multiple responses over a single stream.
 	buf := pool.Get(2 + MaxMsgSize)
 	defer pool.Put(buf)
 	b, err := msg.PackBuffer(buf[2:])
@@ -172,22 +202,34 @@ func (doq *dnsOverQUIC) exchangeQUIC(ctx context.Context, msg *D.Msg) (resp *D.M
 	}
 	binary.BigEndian.PutUint16(buf, uint16(len(b)))
 
-	var conn *quic.Conn
-	conn, err = doq.getConnection(ctx, true)
+	// A query waiting for stream credit must not reconnect on cancellation.
+	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	var stream *quic.Stream
-	stream, err = doq.openStream(ctx, conn)
-	if err != nil {
-		return nil, err
-	}
-
+	cancelDone := make(chan struct{})
 	stop := contextutils.AfterFunc(ctx, func() {
-		_ = stream.SetDeadline(time.Now()) // cancel any read or write operation on this stream
+		stream.CancelRead(QUICCodeRequestCancelled)
+		stream.CancelWrite(QUICCodeRequestCancelled)
+		close(cancelDone)
 	})
-	defer stop()
+	defer func() {
+		// AfterFunc's stop does not wait for a callback already in progress.
+		if !stop() {
+			<-cancelDone
+		}
+		if ctx.Err() != nil {
+			resp, err = nil, ctx.Err()
+		}
+		if err != nil {
+			code := quic.StreamErrorCode(QUICCodeInternalError)
+			if ctx.Err() != nil {
+				code = QUICCodeRequestCancelled
+			}
+			stream.CancelRead(code)
+			stream.CancelWrite(code)
+		}
+	}()
 
 	_, err = stream.Write(buf[:2+len(b)])
 	if err != nil {
@@ -198,79 +240,131 @@ func (doq *dnsOverQUIC) exchangeQUIC(ctx context.Context, msg *D.Msg) (resp *D.M
 	// indicate through the STREAM FIN mechanism that no further data will
 	// be sent on that stream. Note, that stream.Close() closes the
 	// write-direction of the stream, but does not prevent reading from it.
-	_ = stream.Close()
+	if err = stream.Close(); err != nil {
+		return nil, fmt.Errorf("closing QUIC stream write side: %w", err)
+	}
 
 	// -- reading the response ---
 	var respLen uint16
 	err = binary.Read(stream, binary.BigEndian, &respLen)
 	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("%w: truncated response length from %s", errDoQProtocol, doq.Address())
+		}
 		return nil, fmt.Errorf("reading response length from %s: %w", doq.Address(), err)
 	}
 	if respLen == 0 {
-		return nil, fmt.Errorf("received empty response from %s", doq.Address())
+		return nil, fmt.Errorf("%w: empty response from %s", errDoQProtocol, doq.Address())
 	}
 	if respLen > MaxMsgSize {
-		return nil, fmt.Errorf("received response that is too large: %d > %d", respLen, MaxMsgSize)
+		return nil, fmt.Errorf("%w: response is too large: %d > %d", errDoQProtocol, respLen, MaxMsgSize)
 	}
 
 	_, err = io.ReadFull(stream, buf[:respLen])
 	if err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, fmt.Errorf("%w: truncated response from %s", errDoQProtocol, doq.Address())
+		}
 		return nil, fmt.Errorf("reading response from %s: %w", doq.Address(), err)
 	}
 
 	resp = new(D.Msg)
 	err = resp.Unpack(buf[:respLen])
 	if err != nil {
-		return nil, fmt.Errorf("unpacking response from %s: %w", doq.Address(), err)
+		return nil, fmt.Errorf("%w: unpacking response from %s: %v", errDoQProtocol, doq.Address(), err)
+	}
+
+	if resp.Id != 0 {
+		return nil, fmt.Errorf("%w: nonzero response ID from %s", errDoQProtocol, doq.Address())
+	}
+	// Consume the peer's FIN. Reading exactly the DNS payload is not enough
+	// to finish the receive side when the FIN arrives in a later packet.
+	var extra [1]byte
+	n, readErr := io.ReadFull(stream, extra[:])
+	if n != 0 {
+		return nil, fmt.Errorf("%w: unexpected data after response from %s", errDoQProtocol, doq.Address())
+	}
+	if readErr != io.EOF {
+		return nil, fmt.Errorf("reading QUIC stream FIN from %s: %w", doq.Address(), readErr)
 	}
 
 	return resp, nil
 }
 
-// shouldRetry checks what error we received and decides whether it is required
-// to re-open the connection and retry sending the request.
-func (doq *dnsOverQUIC) shouldRetry(err error) (ok bool) {
-	return isQUICRetryError(err)
-}
+// getConnection reuses a live connection or joins the single in-flight dial.
+// Network I/O never holds connMu, and waiting queries honor their own context.
+func (doq *dnsOverQUIC) getConnection(ctx context.Context) (*quic.Conn, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		doq.connMu.Lock()
+		if doq.closed {
+			doq.connMu.Unlock()
+			return nil, net.ErrClosed
+		}
+		if conn := doq.conn; conn != nil {
+			if conn.Context().Err() == nil {
+				doq.connMu.Unlock()
+				return conn, nil
+			}
+			// A terminated quic.Conn releases its single-use transport itself.
+			doq.conn = nil
+		}
+		if call := doq.dialing; call != nil {
+			doq.connMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-call.done:
+			}
+			// One caller's cancelled handshake must not cancel other queries.
+			if call.err != nil && !errors.Is(call.err, errDoQReset) &&
+				!errors.Is(call.err, context.Canceled) && !errors.Is(call.err, context.DeadlineExceeded) {
+				return nil, call.err
+			}
+			continue
+		}
 
-// getConnection opens or returns an existing *quic.Conn. useCached
-// argument controls whether we should try to use the existing cached
-// connection.  If it is false, we will forcibly create a new connection and
-// close the existing one if needed.
-func (doq *dnsOverQUIC) getConnection(ctx context.Context, useCached bool) (*quic.Conn, error) {
-	var conn *quic.Conn
-	doq.connMu.RLock()
-	conn = doq.conn
-	if conn != nil && useCached {
-		doq.connMu.RUnlock()
+		dialCtx, cancel := context.WithCancel(ctx)
+		call := &doqDialCall{done: make(chan struct{}), cancel: cancel}
+		doq.dialing = call
+		doq.connMu.Unlock()
 
+		conn, err := doq.openConnection(dialCtx)
+		cancel()
+
+		doq.connMu.Lock()
+		switch {
+		case doq.closed:
+			err = net.ErrClosed
+		case call.abandoned:
+			err = errDoQReset
+		case ctx.Err() != nil:
+			err = ctx.Err()
+		}
+		if err == nil {
+			doq.conn = conn
+		} else if conn != nil {
+			// A reset/close may race with a successful handshake. Never publish
+			// or leak that connection. Close outside the state lock.
+			doq.connMu.Unlock()
+			_ = conn.CloseWithError(QUICCodeNoError, "")
+			doq.connMu.Lock()
+		}
+		call.err = err
+		doq.dialing = nil
+		close(call.done)
+		doq.connMu.Unlock()
+
+		if errors.Is(err, errDoQReset) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
 		return conn, nil
 	}
-	if conn != nil {
-		// we're recreating the connection, let's create a new one.
-		_ = conn.CloseWithError(QUICCodeNoError, "")
-	}
-	doq.connMu.RUnlock()
-
-	doq.connMu.Lock()
-	defer doq.connMu.Unlock()
-
-	var err error
-	conn, err = doq.openConnection(ctx)
-	if err != nil {
-		return nil, err
-	}
-	doq.conn = conn
-
-	return conn, nil
-}
-
-// hasConnection returns true if there's an active QUIC connection.
-func (doq *dnsOverQUIC) hasConnection() (ok bool) {
-	doq.connMu.Lock()
-	defer doq.connMu.Unlock()
-
-	return doq.conn != nil
 }
 
 // getQUICConfig returns the QUIC config in a thread-safe manner.  Note, that
@@ -292,26 +386,6 @@ func (doq *dnsOverQUIC) resetQUICConfig() {
 	doq.quicConfig.TokenStore = newQUICTokenStore()
 }
 
-// openStream opens a new QUIC stream for the specified connection.
-func (doq *dnsOverQUIC) openStream(ctx context.Context, conn *quic.Conn) (*quic.Stream, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	stream, err := conn.OpenStreamSync(ctx)
-	if err == nil {
-		return stream, nil
-	}
-
-	// We can get here if the old QUIC connection is not valid anymore.  We
-	// should try to re-create the connection again in this case.
-	newConn, err := doq.getConnection(ctx, false)
-	if err != nil {
-		return nil, err
-	}
-	// Open a new stream.
-	return newConn.OpenStreamSync(ctx)
-}
-
 // openConnection opens a new QUIC connection.
 func (doq *dnsOverQUIC) openConnection(ctx context.Context) (quicConn *quic.Conn, err error) {
 	// we're using bootstrapped address instead of what's passed to the function
@@ -331,7 +405,14 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (quicConn *quic.Conn
 	}
 
 	p, err := strconv.Atoi(port)
-	udpAddr := net.UDPAddr{IP: net.ParseIP(ip), Port: p}
+	if err != nil || p < 1 || p > 65535 {
+		return nil, fmt.Errorf("invalid QUIC port: %q", port)
+	}
+	// ResolveUDPAddr also preserves the zone of an IPv6 link-local address.
+	udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip, strconv.Itoa(p)))
+	if err != nil {
+		return nil, err
+	}
 	packetConn, err := doq.dialer.ListenPacket(ctx, "udp", addr)
 	if err != nil {
 		return nil, err
@@ -362,8 +443,9 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (quicConn *quic.Conn
 	transport := quic.Transport{Conn: packetConn}
 	transport.SetCreatedConn(true) // auto close conn
 	transport.SetSingleUse(true)   // auto close transport
-	quicConn, err = transport.Dial(ctx, &udpAddr, tlsConfig, doq.getQUICConfig())
+	quicConn, err = transport.Dial(ctx, udpAddr, tlsConfig, doq.getQUICConfig())
 	if err != nil {
+		_ = transport.Close()
 		_ = packetConn.Close()
 		return nil, fmt.Errorf("opening quic connection to %s: %w", doq.addr, err)
 	}
@@ -371,37 +453,31 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (quicConn *quic.Conn
 	return quicConn, nil
 }
 
-// closeConnWithError closes the active connection with error to make sure that
-// new queries were processed in another connection.  We can do that in the case
-// of a fatal error.
-func (doq *dnsOverQUIC) closeConnWithError(err error) {
+// closeConnWithError retires only the failed connection. Another query may
+// already have installed a replacement by the time this error is processed.
+func (doq *dnsOverQUIC) closeConnWithError(conn *quic.Conn, err error) {
 	doq.connMu.Lock()
-	defer doq.connMu.Unlock()
-
-	if doq.conn == nil {
-		// Do nothing, there's no active conn anyways.
-		return
+	if doq.conn == conn {
+		doq.conn = nil
+		if errors.Is(err, quic.Err0RTTRejected) {
+			doq.resetQUICConfig()
+		}
 	}
+	doq.connMu.Unlock()
 
-	code := QUICCodeNoError
-	if err != nil {
-		code = QUICCodeInternalError
+	code := QUICCodeInternalError
+	if err == nil {
+		code = QUICCodeNoError
+	} else if errors.Is(err, errDoQProtocol) {
+		code = QUICCodeProtocolError
 	}
-
-	if errors.Is(err, quic.Err0RTTRejected) {
-		// Reset the TokenStore only if 0-RTT was rejected.
-		doq.resetQUICConfig()
+	if closeErr := conn.CloseWithError(code, ""); closeErr != nil {
+		log.Errorln("failed to close the QUIC conn: %v", closeErr)
 	}
-
-	err = doq.conn.CloseWithError(code, "")
-	if err != nil {
-		log.Errorln("failed to close the conn: %v", err)
-	}
-	doq.conn = nil
 }
 
-// newQUICTokenStore creates a new quic.TokenStore that is necessary to have
-// in order to benefit from 0-RTT.
+// newQUICTokenStore caches address-validation tokens. Transport.Dial does not
+// send 0-RTT application data; that would require DialEarly and session caching.
 func newQUICTokenStore() (s quic.TokenStore) {
 	// You can read more on address validation here:
 	// https://datatracker.ietf.org/doc/html/rfc9000#section-8.1
